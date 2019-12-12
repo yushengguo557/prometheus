@@ -717,42 +717,20 @@ func (w *Writer) writePosting(name, value string, offs []uint32) error {
 		offset: w.pos,
 	})
 
-	startPos := w.pos
-	// Leave 4 bytes of space for the length, which will be calculated later.
-	if err := w.write([]byte("alen")); err != nil {
-		return err
-	}
-	w.crc32.Reset()
-
 	w.buf1.Reset()
 	w.buf1.PutBE32int(len(offs))
-	w.buf1.WriteToHash(w.crc32)
-	if err := w.write(w.buf1.Get()); err != nil {
-		return err
-	}
 
 	for _, off := range offs {
 		if off > (1<<32)-1 {
 			return errors.Errorf("series offset %d exceeds 4 bytes", off)
 		}
-		w.buf1.Reset()
 		w.buf1.PutBE32(off)
-		w.buf1.WriteToHash(w.crc32)
-		if err := w.write(w.buf1.Get()); err != nil {
-			return err
-		}
 	}
 
-	// Write out the length.
-	w.buf1.Reset()
-	w.buf1.PutBE32int(int(w.pos - startPos - 4))
-	if err := w.writeAt(w.buf1.Get(), startPos); err != nil {
-		return err
-	}
-
-	w.buf1.Reset()
-	w.buf1.PutHashSum(w.crc32)
-	return w.write(w.buf1.Get())
+	w.buf2.Reset()
+	w.buf2.PutBE32int(w.buf1.Len())
+	w.buf1.PutHash(w.crc32)
+	return w.write(w.buf2.Get(), w.buf1.Get())
 }
 
 type uint32slice []uint32
