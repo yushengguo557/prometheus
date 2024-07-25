@@ -1,22 +1,22 @@
-package ecs
+package aliyun
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"time"
+
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
 	"github.com/denverdino/aliyungo/metadata"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/refresh"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
-	"net"
-	"os"
-	"strconv"
-	"time"
 
 	ecs_pop "github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 )
@@ -40,37 +40,70 @@ const (
 	MAX_PAGE_LIMIT = 50 // it's limited by ecs describeInstances API
 )
 
+var DefaultECSConfig = ECSConfig{
+	Port:            8888,
+	RefreshInterval: model.Duration(60 * time.Second),
+	Limit:           100,
+}
+
 // ECSConfig is the configuration for Aliyun based service discovery.
 type ECSConfig struct {
 	Port            int            `yaml:"port"`
 	UserId          string         `yaml:"user_id,omitempty"`
 	RefreshInterval model.Duration `yaml:"refresh_interval,omitempty"`
-	RegionId        string         `yaml:"region_id,omitempty"` // env set PROMETHEUS_DS_ECS_REGION_ID
+	RegionId        string         `yaml:"region_id,omitempty"`
 	TagFilters      []*TagFilter   `yaml:"tag_filters"`
 
 	// Alibaba ECS Auth Args
 	// https://github.com/aliyun/alibaba-cloud-sdk-go/blob/master/docs/2-Client-EN.md
-	AccessKey         string `yaml:"access_key,omitempty"`         // env set PROMETHEUS_DS_ECS_AK
-	AccessKeySecret   string `yaml:"access_key_secret,omitempty"`  // env set PROMETHEUS_DS_ECS_SK
-	StsToken          string `yaml:"sts_token,omitempty"`          // env set PROMETHEUS_DS_ECS_STS_TOKEN
-	RoleArn           string `yaml:"role_arn,omitempty"`           // env set PROMETHEUS_DS_ECS_ROLE_ARN
-	RoleSessionName   string `yaml:"role_session_name,omitempty"`  // env set PROMETHEUS_DS_ECS_ROLE_SESSION_NAME
-	Policy            string `yaml:"policy,omitempty"`             // env set PROMETHEUS_DS_ECS_POLICY
-	RoleName          string `yaml:"role_name,omitempty"`          // env set PROMETHEUS_DS_ECS_ROLE_NAME
-	PublicKeyId       string `yaml:"public_key_id,omitempty"`      // env set PROMETHEUS_DS_ECS_PUBLIC_KEY_ID
-	PrivateKey        string `yaml:"private_key,omitempty"`        // env set PROMETHEUS_DS_ECS_PRIVATE_KEY
-	SessionExpiration int    `yaml:"session_expiration,omitempty"` // env set PROMETHEUS_DS_ECS_SESSION_EXPIRATION
+	AccessKey         string `yaml:"access_key,omitempty"`
+	AccessKeySecret   string `yaml:"access_key_secret,omitempty"`
+	StsToken          string `yaml:"sts_token,omitempty"`
+	RoleArn           string `yaml:"role_arn,omitempty"`
+	RoleSessionName   string `yaml:"role_session_name,omitempty"`
+	Policy            string `yaml:"policy,omitempty"`
+	RoleName          string `yaml:"role_name,omitempty"`
+	PublicKeyId       string `yaml:"public_key_id,omitempty"`
+	PrivateKey        string `yaml:"private_key,omitempty"`
+	SessionExpiration int    `yaml:"session_expiration,omitempty"`
 
 	// query ecs limit, default is 100.
 	Limit int `yaml:"limit,omitempty"`
 }
 
-// Name returns the name of the EC2 Config.
+func init() {
+	discovery.RegisterConfig(&ECSConfig{})
+}
+
+// Name returns the name of the ECS Config.
 func (*ECSConfig) Name() string { return "ecs" }
 
 // NewDiscoverer returns a Discoverer for the ECS Config.
 func (c *ECSConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
-	return NewECSDiscovery(c, opts.Logger), nil
+	return NewECSDiscovery(c, opts.Logger, opts.Metrics)
+}
+
+// NewDiscovererMetrics implements discovery.Config.
+func (*ECSConfig) NewDiscovererMetrics(reg prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
+	return newDiscovererMetrics(reg, rmi)
+}
+
+func (c *ECSConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = DefaultECSConfig
+	type plain ECSConfig
+	err := unmarshal((*plain)(c))
+	if err != nil {
+		return err
+	}
+	for _, f := range c.TagFilters {
+		if len(f.Values) == 0 {
+			return errors.New("ECS SD configuration filter values cannot be empty")
+		}
+	}
+	if len(c.RegionId) == 0 {
+		return errors.New("ECS SD configuration need RegionId")
+	}
+	return nil
 }
 
 // Filter is the configuration tags for filtering ECS instances.
@@ -87,10 +120,16 @@ type Discovery struct {
 	limit  int
 
 	tgCache *targetgroup.Group
+	metrics *ecsMetrics
 }
 
 // NewECSDiscovery returns a new ECSDiscovery which periodically refreshes its targets.
-func NewECSDiscovery(cfg *ECSConfig, logger log.Logger) discovery.Discoverer {
+func NewECSDiscovery(cfg *ECSConfig, logger log.Logger, metrics discovery.DiscovererMetrics) (discovery.Discoverer, error) {
+	m, ok := metrics.(*ecsMetrics)
+	if !ok {
+		return nil, fmt.Errorf("invalid discovery metrics type")
+	}
+
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -100,111 +139,54 @@ func NewECSDiscovery(cfg *ECSConfig, logger log.Logger) discovery.Discoverer {
 		limit:   cfg.Limit,
 		logger:  logger,
 		tgCache: &targetgroup.Group{},
+		metrics: m,
 	}
-	d.Discovery = refresh.NewDiscovery(
-		logger,
-		"ecs",
-		time.Duration(cfg.RefreshInterval),
-		d.refresh,
-	)
-	return d
+
+	d.Discovery = refresh.NewDiscovery(refresh.Options{
+		Logger:              logger,
+		Mech:                "ecs",
+		Interval:            time.Duration(cfg.RefreshInterval),
+		RefreshF:            d.refresh,
+		MetricsInstantiator: m.refreshMetrics,
+	})
+	return d, nil
 }
 
 func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
-
 	defer level.Debug(d.logger).Log("msg", "ECS discovery completed")
 
-	var instances []ecs_pop.Instance
+	d.metrics.queryCount.Inc()
 
-	if d.ecsCfg != nil && d.ecsCfg.TagFilters != nil && len(d.ecsCfg.TagFilters) > 0 {
-		// 1. tagFilter situation. query ListTagResources first, then query DiscribeInstances
-		instancesFromListTagResources, queryInstanceErr := d.queryFromListTagResources()
-		if queryInstanceErr != nil {
-			return nil, queryInstanceErr
-		}
-		instances = instancesFromListTagResources
-	} else {
-		// 2. no tagFilter situation. query DiscribeInstances, then do cache double check.
-		instancesFromDiscribeInstances, queryInstanceErr := d.queryFromDescribeInstances()
-		if queryInstanceErr != nil {
-			return nil, queryInstanceErr
-		}
-		instances = instancesFromDiscribeInstances
+	level.Info(d.logger).Log("msg", "New ECS Client with config and logger.")
+	client, err := NewECSClient(d.ecsCfg, d.logger)
+	if err != nil {
+		level.Debug(d.logger).Log("msg", "NewECSClient", "err: ", err)
+		return nil, err
+	}
 
-		instancesFromCacheReCheck := d.getCacheReCheckInstances()
-		level.Info(d.logger).Log("msg", "Found Instances from cache re-check during ECS discovery.", "count", len(instancesFromCacheReCheck))
-		instances = mergeHashInstances(instances, instancesFromCacheReCheck)
+	level.Info(d.logger).Log("msg", "Query Instances with Aliyun OpenAPI.")
+	instances, err := client.QueryInstances(d.ecsCfg.TagFilters, d.tgCache)
+	if err != nil {
+		level.Debug(d.logger).Log("msg", "QueryInstances", "err: ", err)
+		d.metrics.queryFailuresCount.Inc()
+		return nil, err
 	}
 
 	// build instances list.
-
 	level.Info(d.logger).Log("msg", "Found Instances from remote during ECS discovery.", "count", len(instances))
 
 	tg := &targetgroup.Group{
-		Source: getConfigRegionId(d.ecsCfg.RegionId),
+		Source: d.ecsCfg.RegionId,
 	}
 
 	noIpAddressInstanceCount := 0
 	for _, instance := range instances {
-
-		labels := model.LabelSet{
-			ecsLabelInstanceId:  model.LabelValue(instance.InstanceId),
-			ecsLabelRegionId:    model.LabelValue(instance.RegionId),
-			ecsLabelStatus:      model.LabelValue(instance.Status),
-			ecsLabelZoneId:      model.LabelValue(instance.ZoneId),
-			ecsLabelNetworkType: model.LabelValue(instance.InstanceNetworkType),
-		}
-
-		if d.ecsCfg.UserId != "" {
-			labels[ecsLabelUserId] = model.LabelValue(d.ecsCfg.UserId)
-		}
-
-		// instance must have AddressLabel
-		isAddressLabelExist := false
-
-		// check classic public ip
-		if len(instance.PublicIpAddress.IpAddress) > 0 {
-			labels[ecsLabelPublicIp] = model.LabelValue(instance.PublicIpAddress.IpAddress[0])
-			addr := net.JoinHostPort(instance.PublicIpAddress.IpAddress[0], fmt.Sprintf("%d", d.port))
-			labels[model.AddressLabel] = model.LabelValue(addr)
-			isAddressLabelExist = true
-		}
-
-		// check classic inner ip
-		if len(instance.InnerIpAddress.IpAddress) > 0 {
-			labels[ecsLabelInnerIp] = model.LabelValue(instance.InnerIpAddress.IpAddress[0])
-			addr := net.JoinHostPort(instance.InnerIpAddress.IpAddress[0], fmt.Sprintf("%d", d.port))
-			labels[model.AddressLabel] = model.LabelValue(addr)
-			isAddressLabelExist = true
-		}
-
-		// check vpc eip
-		if instance.EipAddress.IpAddress != "" {
-			labels[ecsLabelEip] = model.LabelValue(instance.EipAddress.IpAddress)
-			addr := net.JoinHostPort(instance.EipAddress.IpAddress, fmt.Sprintf("%d", d.port))
-			labels[model.AddressLabel] = model.LabelValue(addr)
-			isAddressLabelExist = true
-		}
-
-		// check vpc private ip
-		if len(instance.VpcAttributes.PrivateIpAddress.IpAddress) > 0 {
-			labels[ecsLabelPrivateIp] = model.LabelValue(instance.VpcAttributes.PrivateIpAddress.IpAddress[0])
-			addr := net.JoinHostPort(instance.VpcAttributes.PrivateIpAddress.IpAddress[0], fmt.Sprintf("%d", d.port))
-			labels[model.AddressLabel] = model.LabelValue(addr)
-			isAddressLabelExist = true
-		}
-
-		if !isAddressLabelExist {
-			level.Debug(d.logger).Log("msg", "Instance dont have AddressLabel.", "instance: ", fmt.Sprintf("%v", instance))
+		labels, err := addLabel(d.ecsCfg.UserId, d.port, instance)
+		if err != nil {
 			noIpAddressInstanceCount++
+			level.Debug(d.logger).Log("msg", "Instance dont have AddressLabel.", "instance: ", fmt.Sprintf("%v", instance))
 			continue
 		}
-
-		// tags
-		for _, tag := range instance.Tags.Tag {
-			labels[ecsLabelTag+model.LabelName(tag.TagKey)] = model.LabelValue(tag.TagValue)
-		}
-
 		tg.Targets = append(tg.Targets, labels)
 	}
 
@@ -219,10 +201,33 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 	return []*targetgroup.Group{tg}, nil
 }
 
-func (d *Discovery) filterInstancesIdFromListTagResources(token string) (instanceIdsStr string, nextToken string, err error) {
+func (cli *ecsClient) QueryInstances(tagFilters []*TagFilter, cache *targetgroup.Group) ([]ecs_pop.Instance, error) {
+	if len(tagFilters) > 0 { // len(tagFilters) = 0 when tagFilters = nil
+		// 1. tagFilter situation. query ListTagResources first, then query DescribeInstances
+		instancesFromListTagResources, err := cli.queryFromListTagResources(tagFilters)
+		if err != nil {
+			level.Debug(cli.logger).Log("msg", "Query Instances from ListTagResources during ECS discovery.", "err", err)
+			return nil, err
+		}
+		return instancesFromListTagResources, nil
+	}
 
+	// 2. no tagFilter situation. query DescribeInstances, then do cache double check.
+	instancesFromDescribeInstances, err := cli.queryFromDescribeInstances()
+	if err != nil {
+		level.Debug(cli.logger).Log("msg", "Query Instances from DescribeInstances during ECS discovery.", "err", err)
+		return nil, fmt.Errorf("query from DescribeInstances in QueryInstances, err: %w", err)
+	}
+	instancesFromCacheReCheck := cli.getCacheReCheckInstances(cache)
+	level.Info(cli.logger).Log("msg", "Found Instances from cache re-check during ECS discovery.", "count", len(instancesFromCacheReCheck))
+	instances := mergeHashInstances(instancesFromDescribeInstances, instancesFromCacheReCheck)
+	return instances, nil
+}
+
+// listTagInstanceIds get instance ids and filterred by tag
+func (cli *ecsClient) listTagInstanceIds(token string, tagFilters []*TagFilter) ([]string, string, error) {
 	listTagResourcesRequest := ecs_pop.CreateListTagResourcesRequest()
-	listTagResourcesRequest.RegionId = getConfigRegionId(d.ecsCfg.RegionId)
+	listTagResourcesRequest.RegionId = cli.regionId
 	listTagResourcesRequest.ResourceType = "instance"
 
 	// FIRST token is empty, and continue
@@ -230,347 +235,253 @@ func (d *Discovery) filterInstancesIdFromListTagResources(token string) (instanc
 		if token != "" && token != "ICM=" {
 			listTagResourcesRequest.NextToken = token
 		} else {
-			return "[]", "", nil
+			return []string{}, "", errors.New("token is empty, but not first request")
 		}
 	}
 
-	// tag filters
-	tagsFilters := []ecs_pop.ListTagResourcesTagFilter{}
-	for _, tagFilter := range d.ecsCfg.TagFilters {
+	filters := tagFiltersCast(tagFilters)
+	listTagResourcesRequest.TagFilter = &filters
+	response, err := cli.ListTagResources(listTagResourcesRequest)
+	if err != nil {
+		return []string{}, "", fmt.Errorf("response from ListTagResources, err: %w", err)
+	}
+	level.Debug(cli.logger).Log("msg", "get response from ListTagResources.", "response: ", response)
+
+	tagResources := response.TagResources.TagResource
+	if len(tagResources) == 0 { // len(tagResources) = 0 when tagResources = nil
+		level.Debug(cli.logger).Log("msg", "ListTagResourcesTagFilter found no resources.", "response: ", response)
+		return []string{}, "", nil
+	}
+
+	var resourceIds []string
+	for _, tagResource := range tagResources {
+		resourceIds = append(resourceIds, tagResource.ResourceId)
+	}
+	level.Debug(cli.logger).Log("msg", "listTagResource and get ECS instanceIds. for ListTagResourcesTagFilter.", "instanceIds: ", resourceIds)
+	return resourceIds, response.NextToken, nil
+}
+
+func tagFiltersCast(tagFilters []*TagFilter) (ret []ecs_pop.ListTagResourcesTagFilter) {
+	for _, tagFilter := range tagFilters {
 		if len(tagFilter.Values) == 0 {
-			return "[]", "", errors.New("ECS SD configuration filter values cannot be empty.")
+			return
 		}
 		tagFilter := ecs_pop.ListTagResourcesTagFilter{
 			TagKey:    tagFilter.Key,
 			TagValues: &tagFilter.Values,
 		}
-		tagsFilters = append(tagsFilters, tagFilter)
+		ret = append(ret, tagFilter)
 	}
-	listTagResourcesRequest.TagFilter = &tagsFilters
-
-	client, clientErr := getEcsClient(d.ecsCfg, d.logger)
-
-	level.Debug(d.logger).Log("msg", "Start to get Ecs Client from ram. for ListTagResourcesTagFilter.", "client: ", client)
-
-	if clientErr != nil {
-		return "[]", "", errors.Wrap(clientErr, "could not create alibaba ecs client.")
-	}
-
-	response, responseErr := client.ListTagResources(listTagResourcesRequest)
-	if responseErr != nil {
-		return "[]", "", errors.Wrap(responseErr, "could not get response from ListTagResources.")
-	}
-	level.Debug(d.logger).Log("msg", "get response from ListTagResources.", "response: ", response)
-
-	if response.TagResources.TagResource == nil || len(response.TagResources.TagResource) == 0 {
-		level.Debug(d.logger).Log("msg", "ListTagResourcesTagFilter found no resources.", "response: ", response)
-		return "[]", "", nil
-	}
-
-	var resourceIds []string
-	for _, tagResource := range response.TagResources.TagResource {
-		resourceIds = append(resourceIds, tagResource.ResourceId)
-	}
-	resourceIdsJsonArrayStrBytes, jsonErr := json.Marshal(resourceIds)
-	if jsonErr != nil {
-		return "[]", "", errors.Wrap(jsonErr, "ListTagResources jsonErr.")
-	}
-
-	resourceIdsJsonArrayStr := string(resourceIdsJsonArrayStrBytes)
-	level.Debug(d.logger).Log("msg", "listTagResource and get ECS instanceIds. for ListTagResourcesTagFilter.", "instanceIds: ", resourceIdsJsonArrayStr)
-	return resourceIdsJsonArrayStr, response.NextToken, nil
+	return
 }
 
-// this method's result is merged by cache re-check and new api query. because page type query will lose instances when frequently scale-up and scale-down.
-func (d *Discovery) queryFromDescribeInstances() (instances []ecs_pop.Instance, err error) {
-
+func (cli *ecsClient) queryFromDescribeInstances() ([]ecs_pop.Instance, error) {
 	describeInstancesRequest := ecs_pop.CreateDescribeInstancesRequest()
-	describeInstancesRequest.RegionId = getConfigRegionId(d.ecsCfg.RegionId)
+	describeInstancesRequest.RegionId = cli.regionId
+	describeInstancesRequest.PageSize = requests.NewInteger(MAX_PAGE_LIMIT)
 
-	// page query
-	var pageLimit = MAX_PAGE_LIMIT
-	var currentLimit = d.limit
-	var currentTotalCount = 0
-	var totalCount = 0
-	if d.limit <= 0 || d.limit > MAX_PAGE_LIMIT {
-		pageLimit = MAX_PAGE_LIMIT
-	} else {
-		pageLimit = d.limit
-	}
-	describeInstancesRequest.PageNumber = requests.NewInteger(1)
-	describeInstancesRequest.PageSize = requests.NewInteger(pageLimit)
-
-	client, clientErr := getEcsClient(d.ecsCfg, d.logger)
-
-	level.Debug(d.logger).Log("msg", "Start to get Ecs Client from ram.", "client: ", client)
-
-	if clientErr != nil {
-		return nil, errors.Wrap(clientErr, "could not create alibaba ecs client.")
+	instances := make([]ecs_pop.Instance, 0)
+	pageLimit := MAX_PAGE_LIMIT // number of instances in one page
+	pageNumber := 1
+	neededCount := MAX_PAGE_LIMIT // number of instances still needed
+	if cli.limit >= 0 {
+		neededCount = cli.limit
 	}
 
-	describeInstancesResponse, responseErr := client.DescribeInstances(describeInstancesRequest)
-
-	level.Debug(d.logger).Log("msg", "getResponse from describeInstancesResponse.", "requestId: ", describeInstancesRequest, "describeInstancesResponse: ", describeInstancesResponse)
-
-	if responseErr != nil {
-		return nil, errors.Wrap(responseErr, "could not get ecs describeInstances response.")
-	}
-
-	// first query to get TotalCount
-	instances = describeInstancesResponse.Instances.Instance
-	currentTotalCount = len(describeInstancesResponse.Instances.Instance)
-	totalCount = describeInstancesResponse.TotalCount
-	if d.limit <= 0 {
-		currentLimit = totalCount
-	}
-
-	// multi page query
-	if currentTotalCount < currentLimit {
-
-		for pageIndex := 2; currentTotalCount < currentLimit; pageIndex++ {
-			fmt.Println(fmt.Sprintf("pageIndex: %v", pageIndex))
-			if (currentLimit - currentTotalCount) < MAX_PAGE_LIMIT {
-				pageLimit = currentLimit - currentTotalCount
-			}
-			describeInstancesRequest.PageNumber = requests.NewInteger(pageIndex)
-			describeInstancesRequest.PageSize = requests.NewInteger(MAX_PAGE_LIMIT)
-			describeInstancesResponse, responseErr := client.DescribeInstances(describeInstancesRequest)
-			if responseErr != nil {
-				return nil, errors.Wrap(responseErr, "could not get ecs describeInstances response.")
-			}
-
-			fmt.Println(fmt.Sprintf("responsed pageIndex: %v", pageIndex))
-
-			level.Debug(d.logger).Log("msg", "getResponse from describeInstancesResponse.", "requestId: ", describeInstancesRequest, "describeInstancesResponse: ", describeInstancesResponse, "pageNum: ", pageIndex)
-
-			newInstanceIndex := 0
-			for instanceIndex, instance := range describeInstancesResponse.Instances.Instance {
-				if instanceIndex < pageLimit {
-					newInstanceIndex++
-					instances = append(instances, instance)
-				} else {
-					break
-				}
-			}
-
-			if len(describeInstancesResponse.Instances.Instance) == 0 {
-				break
-			}
-			currentTotalCount += newInstanceIndex
+	for neededCount > 0 {
+		describeInstancesRequest.PageNumber = requests.NewInteger(pageNumber)
+		response, err := cli.DescribeInstances(describeInstancesRequest)
+		if err != nil {
+			return nil, fmt.Errorf("could not get ecs describeInstances response, err: %w", err)
 		}
 
-	}
-
-	return instances, nil
-}
-
-func (d *Discovery) getCacheReCheckInstances() (retInstanceList []ecs_pop.Instance) {
-
-	// get cache targetGroup's instanceIds, and query DescribeInstances again to double check.
-	// every 50 instance per page.
-
-	retInstanceList = []ecs_pop.Instance{}
-	pageCount := 0
-	instanceIdList := []string{}
-	for tgLabelSetIndex, tgLabelSet := range d.tgCache.Targets {
-		instanceId := tgLabelSet[ecsLabelInstanceId]
-
-		pageCount++
-		instanceIdList = append(instanceIdList, string(instanceId))
-
-		// full of one page, or last one of LabelSet Series.
-		if pageCount >= MAX_PAGE_LIMIT || tgLabelSetIndex == (len(d.tgCache.Targets)-1) {
-
-			// query instances
-			describeInstancesRequest := ecs_pop.CreateDescribeInstancesRequest()
-			describeInstancesRequest.RegionId = getConfigRegionId(d.ecsCfg.RegionId)
-			describeInstancesRequest.PageNumber = requests.NewInteger(1)
-			describeInstancesRequest.PageSize = requests.NewInteger(MAX_PAGE_LIMIT)
-
-			InstanceIdsStrByte, jsonErr := json.Marshal(instanceIdList)
-			if jsonErr != nil {
-				level.Error(d.logger).Log("msg", "getCacheReCheckInstances json parse err.", "instanceIdList: ", instanceIdList, "jsonErr: ", jsonErr)
-				continue
-			}
-			describeInstancesRequest.InstanceIds = string(InstanceIdsStrByte)
-
-			client, clientErr := getEcsClient(d.ecsCfg, d.logger)
-
-			if clientErr != nil {
-				level.Error(d.logger).Log("msg", "getCacheReCheckInstances Get ECS Client err.", "err: ", clientErr)
-				continue
-			}
-
-			describeInstancesResponse, responseErr := client.DescribeInstances(describeInstancesRequest)
-
-			level.Debug(d.logger).Log("msg", "getCacheReCheckInstances getResponse from describeInstancesResponse.", "requestId: ", describeInstancesRequest, "describeInstancesResponse: ", describeInstancesResponse)
-
-			if responseErr != nil {
-				level.Error(d.logger).Log("msg", "getCacheReCheckInstances describeInstancesResponse err.", "requestId: ", describeInstancesResponse.RequestId, "err: ", responseErr)
-				continue
-			}
-
-			retInstanceList = mergeInstances(retInstanceList, describeInstancesResponse.Instances.Instance)
-
-			// clean page
-			pageCount = 0
-			instanceIdList = []string{}
-		}
-
-	}
-
-	return retInstanceList
-}
-
-func (d *Discovery) queryFromListTagResources() (instances []ecs_pop.Instance, err error) {
-
-	nextToken := "FIRST"
-	var nextTokenInstances []ecs_pop.Instance
-	var getInstancesFromListTagResourcesErr error
-	currentTotalCount := 0
-	originalToken := "INIT"
-	for {
-		if nextToken != "" && nextToken != "ICM=" && originalToken != nextToken {
-
-			originalToken = nextToken
-
-			nextToken, nextTokenInstances, getInstancesFromListTagResourcesErr = d.getInstancesFromListTagResources(nextToken, currentTotalCount)
-
-			if len(nextTokenInstances) == 0 {
-				break
-			}
-
-			currentTotalCount = currentTotalCount + len(nextTokenInstances)
-			if getInstancesFromListTagResourcesErr != nil {
-				return nil, getInstancesFromListTagResourcesErr
-			}
-			instances = mergeInstances(instances, nextTokenInstances)
-		} else {
+		count := len(response.Instances.Instance)
+		if count == 0 {
 			break
 		}
+		// first page
+		if pageNumber == 1 {
+			neededCount = response.TotalCount
+			if cli.limit > 0 {
+				neededCount = min(neededCount, cli.limit)
+			}
+		}
+		// if current page is last page, neededCount < count
+		// else neededCount >= count
+		pageLimit = min(count, neededCount)
+		instances = append(instances, response.Instances.Instance[:pageLimit]...)
+
+		neededCount -= count
+		pageNumber++
 	}
 	return instances, nil
 }
 
-func mergeInstances(instances []ecs_pop.Instance, instances2 []ecs_pop.Instance) []ecs_pop.Instance {
-	for _, each := range instances2 {
-		instances = append(instances, each)
+// getCacheReCheckInstances
+// get cache targetGroup's instanceIds, and query DescribeInstances again to double check.
+// every 50 instance per page.
+func (cli *ecsClient) getCacheReCheckInstances(cache *targetgroup.Group) (retInstances []ecs_pop.Instance) {
+	pageCount := 0
+	instanceIds := []string{}
+	for tgLabelSetIndex, tgLabelSet := range cache.Targets {
+		pageCount++
+
+		instanceId := tgLabelSet[ecsLabelInstanceId]
+		instanceIds = append(instanceIds, string(instanceId))
+
+		// full of one page, or last one of LabelSet Series.
+		if pageCount >= MAX_PAGE_LIMIT || tgLabelSetIndex == (len(cache.Targets)-1) {
+			// query instances
+			instances, err := cli.describeInstances(instanceIds)
+			if err != nil {
+				level.Error(cli.logger).Log("msg", "getCacheReCheckInstances describeInstancesResponse err.", "err: ", err)
+				continue
+			}
+
+			retInstances = append(retInstances, instances...)
+			// clean page
+			pageCount = 0
+			instanceIds = []string{}
+		}
 	}
-	return instances
+	return retInstances
 }
 
-// hash by instanceId and merge. O(n + m)
-func mergeHashInstances(instances []ecs_pop.Instance, instances2 []ecs_pop.Instance) []ecs_pop.Instance {
-	instanceId_instance := make(map[string]ecs_pop.Instance)
-	for _, each := range instances {
-		instanceId_instance[each.InstanceId] = each
-	}
-	for _, each := range instances2 {
-		instanceId_instance[each.InstanceId] = each
-	}
+// queryFromListTagResources
+// token query
+func (cli *ecsClient) queryFromListTagResources(tagFilters []*TagFilter) (instances []ecs_pop.Instance, err error) {
+	token := "FIRST"
+	var currentInstances []ecs_pop.Instance
+	currentTotalCount := 0 // the number of instances that have been queried
+	originalToken := "INIT"
+	for {
+		if token == "" || token == "ICM=" || token == originalToken {
+			break
+		}
 
-	retInstanceList := []ecs_pop.Instance{}
-	for _, eachInstance := range instanceId_instance {
-		retInstanceList = append(retInstanceList, eachInstance)
+		originalToken = token
+		token, currentInstances, err = cli.listTagInstances(token, currentTotalCount, tagFilters)
+		if err != nil {
+			return nil, fmt.Errorf("list tag instances, err: %w", err)
+		}
+
+		if len(currentInstances) == 0 {
+			break
+		}
+		currentTotalCount += len(currentInstances)
+		instances = append(instances, currentInstances...)
 	}
-	return retInstanceList
+	return instances, nil
 }
 
-func (d *Discovery) getInstancesFromListTagResources(token string, currentTotalCount int) (nextToken string, instances []ecs_pop.Instance, err error) {
-
+// describeInstances get instance
+// page query, max size 50 every page
+func (cli *ecsClient) describeInstances(ids []string) ([]ecs_pop.Instance, error) {
 	describeInstancesRequest := ecs_pop.CreateDescribeInstancesRequest()
-	describeInstancesRequest.RegionId = getConfigRegionId(d.ecsCfg.RegionId)
-
-	// list resource from tag
-	filterdInstanceIdsStr, nextToken, listTagErr := d.filterInstancesIdFromListTagResources(token)
-	if listTagErr != nil {
-		return "", nil, errors.Wrap(listTagErr, "get ecs instanceIds err. listTagResourcesError.")
+	describeInstancesRequest.RegionId = cli.regionId
+	idsJson, err := json.Marshal(ids)
+	if err != nil {
+		return []ecs_pop.Instance{}, err
 	}
-	describeInstancesRequest.InstanceIds = filterdInstanceIdsStr
-
-	// page query, max size 50 every page
-	var pageLimit = MAX_PAGE_LIMIT
-	var currentLimit = d.limit - currentTotalCount
-	if currentLimit < MAX_PAGE_LIMIT && currentLimit > 0 {
-		pageLimit = currentLimit
-	}
+	describeInstancesRequest.InstanceIds = string(idsJson)
 	describeInstancesRequest.PageNumber = requests.NewInteger(1)
 	describeInstancesRequest.PageSize = requests.NewInteger(MAX_PAGE_LIMIT)
 
-	client, clientErr := getEcsClient(d.ecsCfg, d.logger)
+	response, err := cli.DescribeInstances(describeInstancesRequest)
+	if err != nil {
+		return []ecs_pop.Instance{}, fmt.Errorf("could not invoke DescribeInstances API, err: %w", err)
+	}
+	return response.Instances.Instance, nil
+}
 
-	level.Debug(d.logger).Log("msg", "Start to get Ecs Client from ram.", "client: ", client)
-
-	if clientErr != nil {
-		return "", nil, errors.Wrap(clientErr, "could not create alibaba ecs client.")
+func (cli *ecsClient) listTagInstances(token string, currentTotalCount int, tagFilters []*TagFilter) (string, []ecs_pop.Instance, error) {
+	ids, nextToken, err := cli.listTagInstanceIds(token, tagFilters)
+	if err != nil {
+		return "", nil, fmt.Errorf("get ecs instanceIds, err: %w", err)
+	}
+	instances, err := cli.describeInstances(ids)
+	if err != nil {
+		return "", nil, fmt.Errorf("get ecs instance ids err: %w", err)
 	}
 
-	describeInstancesResponse, responseErr := client.DescribeInstances(describeInstancesRequest)
-
-	level.Debug(d.logger).Log("msg", "getResponse from describeInstancesResponse.", "requestId: ", describeInstancesRequest, "describeInstancesResponse: ", describeInstancesResponse)
-
-	if responseErr != nil {
-		return "", nil, errors.Wrap(responseErr, "could not get ecs describeInstances response.")
+	pageLimit := len(instances)
+	currentLimit := cli.limit - currentTotalCount // remaining instance count
+	if 0 <= currentLimit && currentLimit < pageLimit {
+		pageLimit = currentLimit
 	}
 
-	if pageLimit < MAX_PAGE_LIMIT {
-		for currentInstanceIndex, instance := range describeInstancesResponse.Instances.Instance {
-			if currentInstanceIndex < pageLimit {
-				instances = append(instances, instance)
-			} else {
-				break
-			}
-		}
-	} else {
-		instances = describeInstancesResponse.Instances.Instance
-	}
+	return nextToken, instances[:pageLimit], nil
+}
 
-	return nextToken, instances, nil
+type client interface {
+	DescribeInstances(request *ecs_pop.DescribeInstancesRequest) (response *ecs_pop.DescribeInstancesResponse, err error)
+	ListTagResources(request *ecs_pop.ListTagResourcesRequest) (response *ecs_pop.ListTagResourcesResponse, err error)
+}
+
+var _ client = &ecsClient{}
+
+type ecsClient struct {
+	regionId string
+	limit    int
+	client
+	logger log.Logger
+}
+
+func NewECSClient(config *ECSConfig, logger log.Logger) (*ecsClient, error) {
+	cli, err := getEcsClient(config, logger)
+	if err != nil {
+		return nil, err
+	}
+	return &ecsClient{
+		regionId: config.RegionId,
+		limit:    config.Limit,
+		client:   cli,
+		logger:   logger,
+	}, nil
 }
 
 func getEcsClient(config *ECSConfig, logger log.Logger) (client *ecs_pop.Client, err error) {
-
 	level.Debug(logger).Log("msg", "Start to get Ecs Client.")
 
-	if getConfigRegionId(config.RegionId) == "" {
+	if config.RegionId == "" {
 		return nil, errors.New("Aliyun ECS service discovery config need regionId.")
 	}
 
 	// 1. Args
 
 	// NewClientWithRamRoleArnAndPolicy
-	if getConfigArgPolicy(config.Policy) != "" && getConfigArgAk(config.AccessKey) != "" && getConfigArgSk(config.AccessKeySecret) != "" && getConfigArgRoleArn(config.RoleArn) != "" && getConfigArgRoleSessionName(config.RoleSessionName) != "" {
-		client, clientErr := ecs_pop.NewClientWithRamRoleArnAndPolicy(getConfigRegionId(config.RegionId), getConfigArgAk(config.AccessKey), getConfigArgSk(config.AccessKeySecret), getConfigArgRoleArn(config.RoleArn), getConfigArgRoleSessionName(config.RoleSessionName), getConfigArgPolicy(config.Policy))
+	if config.Policy != "" && config.AccessKey != "" && config.AccessKeySecret != "" && config.RoleArn != "" && config.RoleSessionName != "" {
+		client, clientErr := ecs_pop.NewClientWithRamRoleArnAndPolicy(config.RegionId, config.AccessKey, config.AccessKeySecret, config.RoleArn, config.RoleSessionName, config.Policy)
 		return client, clientErr
 	}
 
 	// NewClientWithRamRoleArn
-	if getConfigArgRoleSessionName(config.RoleSessionName) != "" && getConfigArgAk(config.AccessKey) != "" && getConfigArgSk(config.AccessKeySecret) != "" && getConfigArgRoleArn(config.RoleArn) != "" {
-		client, clientErr := ecs_pop.NewClientWithRamRoleArn(getConfigRegionId(config.RegionId), getConfigArgAk(config.AccessKey), getConfigArgSk(config.AccessKeySecret), getConfigArgRoleArn(config.RoleArn), getConfigArgRoleSessionName(config.RoleSessionName))
+	if config.RoleSessionName != "" && config.AccessKey != "" && config.AccessKeySecret != "" && config.RoleArn != "" {
+		client, clientErr := ecs_pop.NewClientWithRamRoleArn(config.RegionId, config.AccessKey, config.AccessKeySecret, config.RoleArn, config.RoleSessionName)
 		return client, clientErr
 	}
 
 	// NewClientWithStsToken
-	if getConfigArgStsToken(config.StsToken) != "" && getConfigArgAk(config.AccessKey) != "" && getConfigArgSk(config.AccessKeySecret) != "" {
-		client, clientErr := ecs_pop.NewClientWithStsToken(getConfigRegionId(config.RegionId), getConfigArgAk(config.AccessKey), getConfigArgSk(config.AccessKeySecret), getConfigArgStsToken(config.StsToken))
+	if config.StsToken != "" && config.AccessKey != "" && config.AccessKeySecret != "" {
+		client, clientErr := ecs_pop.NewClientWithStsToken(config.RegionId, config.AccessKey, config.AccessKeySecret, config.StsToken)
 		return client, clientErr
 	}
 
 	// NewClientWithAccessKey
-	if getConfigArgAk(config.AccessKey) != "" && getConfigArgSk(config.AccessKeySecret) != "" {
-		client, clientErr := ecs_pop.NewClientWithAccessKey(getConfigRegionId(config.RegionId), getConfigArgAk(config.AccessKey), getConfigArgSk(config.AccessKeySecret))
+	if config.AccessKey != "" && config.AccessKeySecret != "" {
+		client, clientErr := ecs_pop.NewClientWithAccessKey(config.RegionId, config.AccessKey, config.AccessKeySecret)
 		return client, clientErr
 	}
 
 	// NewClientWithEcsRamRole
 	if config.RoleName != "" {
-		client, clientErr := ecs_pop.NewClientWithEcsRamRole(getConfigRegionId(config.RegionId), getConfigArgRoleName(config.RoleName))
+		client, clientErr := ecs_pop.NewClientWithEcsRamRole(config.RegionId, config.RoleName)
 		return client, clientErr
 	}
 
 	// NewClientWithRsaKeyPair
 	if config.PublicKeyId != "" && config.PrivateKey != "" && config.SessionExpiration != 0 {
-		client, clientErr := ecs_pop.NewClientWithRsaKeyPair(getConfigRegionId(config.RegionId), getConfigArgPublicKeyId(config.PublicKeyId), getConfigArgPrivateKey(config.PrivateKey), getConfigArgSessionExpiration(config.SessionExpiration))
+		client, clientErr := ecs_pop.NewClientWithRsaKeyPair(config.RegionId, config.PublicKeyId, config.PrivateKey, config.SessionExpiration)
 		return client, clientErr
 	}
 
@@ -605,7 +516,7 @@ func getEcsClient(config *ECSConfig, logger log.Logger) (client *ecs_pop.Client,
 				client := ecs_pop.Client{}
 				clientConfig := client.InitClientConfig()
 				clientConfig.Debug = true
-				clientErr := client.InitWithStsToken(getConfigRegionId(config.RegionId), roleAuth.AccessKeyId, roleAuth.AccessKeySecret, roleAuth.SecurityToken)
+				clientErr := client.InitWithStsToken(config.RegionId, roleAuth.AccessKeyId, roleAuth.AccessKeySecret, roleAuth.SecurityToken)
 
 				level.Debug(logger).Log("msg", "Start to get Ecs Client from ram4.")
 
@@ -621,93 +532,80 @@ func getEcsClient(config *ECSConfig, logger log.Logger) (client *ecs_pop.Client,
 	return nil, errors.New("Aliyun ECS service discovery cant init client, need auth config.")
 }
 
-func getConfigArgAk(ak string) string {
-	akEnv := os.Getenv("PROMETHEUS_DS_ECS_AK")
-	if akEnv != "" {
-		return akEnv
+// mergeHashInstances hash by instanceId and merge. O(n + m)
+// The purpose is to remove duplicate elements
+func mergeHashInstances(instances1 []ecs_pop.Instance, instances2 []ecs_pop.Instance) []ecs_pop.Instance {
+	instanceId_instance := make(map[string]ecs_pop.Instance)
+	for _, each := range instances1 {
+		instanceId_instance[each.InstanceId] = each
 	}
-	return ak
+	for _, each := range instances2 {
+		instanceId_instance[each.InstanceId] = each
+	}
+
+	retInstanceList := []ecs_pop.Instance{}
+	for _, eachInstance := range instanceId_instance {
+		retInstanceList = append(retInstanceList, eachInstance)
+	}
+	return retInstanceList
 }
 
-func getConfigArgSk(sk string) string {
-	skEnv := os.Getenv("PROMETHEUS_DS_ECS_SK")
-	if skEnv != "" {
-		return skEnv
+// addLabel add label, return LabelSet and error (!=nil when isAddressLabelExist equal to false)
+func addLabel(userId string, port int, instance ecs_pop.Instance) (model.LabelSet, error) {
+	labels := model.LabelSet{
+		ecsLabelInstanceId:  model.LabelValue(instance.InstanceId),
+		ecsLabelRegionId:    model.LabelValue(instance.RegionId),
+		ecsLabelStatus:      model.LabelValue(instance.Status),
+		ecsLabelZoneId:      model.LabelValue(instance.ZoneId),
+		ecsLabelNetworkType: model.LabelValue(instance.InstanceNetworkType),
 	}
-	return sk
-}
 
-func getConfigArgStsToken(stsToken string) string {
-	stsEnv := os.Getenv("PROMETHEUS_DS_ECS_STS_TOKEN")
-	if stsEnv != "" {
-		return stsEnv
+	if userId != "" {
+		labels[ecsLabelUserId] = model.LabelValue(userId)
 	}
-	return stsToken
-}
 
-func getConfigArgRoleArn(roleArn string) string {
-	roleArnEnv := os.Getenv("PROMETHEUS_DS_ECS_ROLE_ARN")
-	if roleArnEnv != "" {
-		return roleArnEnv
-	}
-	return roleArn
-}
+	// instance must have AddressLabel
+	isAddressLabelExist := false
 
-func getConfigArgRoleSessionName(roleSessionName string) string {
-	roleSessionNameEnv := os.Getenv("PROMETHEUS_DS_ECS_ROLE_SESSION_NAME")
-	if roleSessionNameEnv != "" {
-		return roleSessionNameEnv
+	// check classic public ip
+	if len(instance.PublicIpAddress.IpAddress) > 0 {
+		labels[ecsLabelPublicIp] = model.LabelValue(instance.PublicIpAddress.IpAddress[0])
+		addr := net.JoinHostPort(instance.PublicIpAddress.IpAddress[0], fmt.Sprintf("%d", port))
+		labels[model.AddressLabel] = model.LabelValue(addr)
+		isAddressLabelExist = true
 	}
-	return roleSessionName
-}
 
-func getConfigArgPolicy(policy string) string {
-	policyEnv := os.Getenv("PROMETHEUS_DS_ECS_POLICY")
-	if policyEnv != "" {
-		return policyEnv
+	// check classic inner ip
+	if len(instance.InnerIpAddress.IpAddress) > 0 {
+		labels[ecsLabelInnerIp] = model.LabelValue(instance.InnerIpAddress.IpAddress[0])
+		addr := net.JoinHostPort(instance.InnerIpAddress.IpAddress[0], fmt.Sprintf("%d", port))
+		labels[model.AddressLabel] = model.LabelValue(addr)
+		isAddressLabelExist = true
 	}
-	return policy
-}
 
-func getConfigArgRoleName(roleName string) string {
-	roleNameEnv := os.Getenv("PROMETHEUS_DS_ECS_ROLE_NAME")
-	if roleNameEnv != "" {
-		return roleNameEnv
+	// check vpc eip
+	if instance.EipAddress.IpAddress != "" {
+		labels[ecsLabelEip] = model.LabelValue(instance.EipAddress.IpAddress)
+		addr := net.JoinHostPort(instance.EipAddress.IpAddress, fmt.Sprintf("%d", port))
+		labels[model.AddressLabel] = model.LabelValue(addr)
+		isAddressLabelExist = true
 	}
-	return roleName
-}
 
-func getConfigArgPublicKeyId(publicKeyId string) string {
-	publicKeyIdEnv := os.Getenv("PROMETHEUS_DS_ECS_PUBLIC_KEY_ID")
-	if publicKeyIdEnv != "" {
-		return publicKeyIdEnv
+	// check vpc private ip
+	if len(instance.VpcAttributes.PrivateIpAddress.IpAddress) > 0 {
+		labels[ecsLabelPrivateIp] = model.LabelValue(instance.VpcAttributes.PrivateIpAddress.IpAddress[0])
+		addr := net.JoinHostPort(instance.VpcAttributes.PrivateIpAddress.IpAddress[0], fmt.Sprintf("%d", port))
+		labels[model.AddressLabel] = model.LabelValue(addr)
+		isAddressLabelExist = true
 	}
-	return publicKeyId
-}
 
-func getConfigArgPrivateKey(privateKey string) string {
-	privateKeyEnv := os.Getenv("PROMETHEUS_DS_ECS_PRIVATE_KEY")
-	if privateKeyEnv != "" {
-		return privateKeyEnv
+	if !isAddressLabelExist {
+		return nil, errors.New(fmt.Sprintf("Instance %s dont have AddressLabel.", instance.InstanceId))
 	}
-	return privateKey
-}
 
-func getConfigArgSessionExpiration(sessionExpiration int) int {
-	sessionExpirationEnv := os.Getenv("PROMETHEUS_DS_ECS_SESSION_EXPIRATION")
-	if sessionExpirationEnv != "" {
-		sessionExpirationEnvInt, err := strconv.Atoi(sessionExpirationEnv)
-		if err != nil {
-			return sessionExpirationEnvInt
-		}
+	// tags
+	for _, tag := range instance.Tags.Tag {
+		labels[ecsLabelTag+model.LabelName(tag.TagKey)] = model.LabelValue(tag.TagValue)
 	}
-	return sessionExpiration
-}
-
-func getConfigRegionId(regionId string) string {
-	regionIdEnv := os.Getenv("PROMETHEUS_DS_ECS_REGION_ID")
-	if regionIdEnv != "" {
-		return regionIdEnv
-	}
-	return regionId
+	return labels, nil
 }
