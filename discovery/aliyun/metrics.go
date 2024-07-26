@@ -2,6 +2,7 @@ package aliyun
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/prometheus/prometheus/discovery"
 )
 

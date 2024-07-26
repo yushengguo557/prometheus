@@ -2,35 +2,36 @@ package aliyun
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"testing"
 
 	ecs_pop "github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/go-kit/log"
-	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
+
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 
 	gomock "go.uber.org/mock/gomock"
 	"gopkg.in/yaml.v2"
 )
 
-const UPPER_LIMIT = 1000 // upper limit of the number of instances
+const UpperLimit = 1000 // upper limit of the number of instances
 
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-// newClient create new ecsClient with mockClient
+// newClient create new ecsClient with mockClient.
 func newClient(t *testing.T) *ecsClient {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	mockClient := NewMockclient(ctrl)
 	cli := &ecsClient{
-		regionId: "cn-beijing",
+		regionID: "cn-beijing",
 		limit:    100,
 		client:   mockClient,
 		logger:   log.NewNopLogger(),
@@ -51,11 +52,11 @@ func newClient(t *testing.T) *ecsClient {
 				// return nil, fmt.Errorf("token valid, err: %w", err)
 				return &ecs_pop.ListTagResourcesResponse{}, nil
 			}
-			if start >= UPPER_LIMIT { // up to 1000 instances
+			if start >= UpperLimit { // up to 1000 instances
 				return &ecs_pop.ListTagResourcesResponse{}, nil
 			}
 
-			end := min(UPPER_LIMIT, start+MAX_PAGE_LIMIT)
+			end := min(UpperLimit, start+MaxPageLimit)
 			tagResources := make([]ecs_pop.TagResource, end-start)
 			for i := start; i < end; i++ {
 				tagResource := ecs_pop.TagResource{
@@ -68,7 +69,7 @@ func newClient(t *testing.T) *ecsClient {
 			}
 			listTagResponse := ecs_pop.ListTagResourcesResponse{
 				TagResources: ecs_pop.TagResources{TagResource: tagResources},
-				NextToken:    strconv.Itoa(start + MAX_PAGE_LIMIT),
+				NextToken:    strconv.Itoa(start + MaxPageLimit),
 			}
 			return &listTagResponse, nil
 		}).AnyTimes()
@@ -79,7 +80,7 @@ func newClient(t *testing.T) *ecsClient {
 		)).
 		DoAndReturn(func(request *ecs_pop.DescribeInstancesRequest) (*ecs_pop.DescribeInstancesResponse, error) {
 			// construct data
-			totalCount := UPPER_LIMIT
+			totalCount := UpperLimit
 			allInstances := make([]ecs_pop.Instance, totalCount)
 			for i := 0; i < totalCount; i++ {
 				instance := ecs_pop.Instance{
@@ -210,7 +211,7 @@ func TestECSConfigUnmarshalYAML(t *testing.T) {
 		{
 			name: "WithoutTagFilterValue",
 			input: ECSConfig{
-				RegionId:   "cn-beijing",
+				RegionID:   "cn-beijing",
 				TagFilters: []*TagFilter{{Key: "test", Values: []string{}}},
 			},
 			expectedError: errors.New("ECS SD configuration filter values cannot be empty"),
@@ -218,7 +219,7 @@ func TestECSConfigUnmarshalYAML(t *testing.T) {
 		{
 			name: "ValidECSConfig",
 			input: ECSConfig{
-				RegionId:   "cn-beijing",
+				RegionID:   "cn-beijing",
 				TagFilters: []*TagFilter{{Key: "test", Values: []string{"test"}}},
 			},
 			expectedError: nil,
@@ -242,14 +243,14 @@ func TestECSConfigUnmarshalYAML(t *testing.T) {
 func TestAddLabel(t *testing.T) {
 	testCases := []struct {
 		name           string
-		userId         string
+		userID         string
 		port           int
 		instance       ecs_pop.Instance
 		expectedLabels model.LabelSet
 		expectedError  error
 	}{{
 		name:   "ClassicNetwork",
-		userId: "testUserId",
+		userID: "testUserId",
 		port:   8888,
 		instance: ecs_pop.Instance{
 			InstanceId:          "1",
@@ -268,14 +269,14 @@ func TestAddLabel(t *testing.T) {
 			},
 		},
 		expectedLabels: model.LabelSet{
-			ecsLabelInstanceId:  "1",
-			ecsLabelRegionId:    "cn-beijing",
+			ecsLabelInstanceID:  "1",
+			ecsLabelRegionID:    "cn-beijing",
 			ecsLabelStatus:      "Running",
-			ecsLabelZoneId:      "cn-beijing",
+			ecsLabelZoneID:      "cn-beijing",
 			ecsLabelNetworkType: "Classic",
-			ecsLabelUserId:      "testUserId",
-			ecsLabelPublicIp:    "1.2.3.4",
-			ecsLabelInnerIp:     "10.0.0.1",
+			ecsLabelUserID:      "testUserId",
+			ecsLabelPublicIP:    "1.2.3.4",
+			ecsLabelInnerIP:     "10.0.0.1",
 			model.AddressLabel:  "10.0.0.1:8888",
 			ecsLabelTag + "app": "k8s",
 		},
@@ -284,7 +285,7 @@ func TestAddLabel(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			labels, err := addLabel(tc.userId, tc.port, tc.instance)
+			labels, err := addLabel(tc.userID, tc.port, tc.instance)
 			require.Equal(t, tc.expectedError, err)
 			require.True(t, labels.Equal(tc.expectedLabels))
 		})
@@ -301,7 +302,7 @@ func TestQueryInstances(t *testing.T) {
 	allInstances := make([]ecs_pop.Instance, totalCount)
 	for i := 0; i < totalCount; i++ {
 		labelSet := model.LabelSet{
-			ecsLabelInstanceId: model.LabelValue(strconv.Itoa(i)),
+			ecsLabelInstanceID: model.LabelValue(strconv.Itoa(i)),
 		}
 		allLabelSets[i] = labelSet
 
@@ -353,7 +354,6 @@ func TestQueryInstances(t *testing.T) {
 			require.True(t, instancesEqual(tc.expectedInstances, instances))
 		})
 	}
-
 }
 
 func TestQueryFromListTagResources(t *testing.T) {
@@ -372,23 +372,23 @@ func TestQueryFromListTagResources(t *testing.T) {
 		},
 		{
 			name:                   "Limit:20",
-			limit:                  20, // less than [MAX_PAGE_LIMIT]
+			limit:                  20, // less than [MaxPageLimit]
 			expectedInstancesCount: 20,
 		},
 		{
 			name:                   "Limit:50",
-			limit:                  50, // equal to [MAX_PAGE_LIMIT]
+			limit:                  50, // equal to [MaxPageLimit]
 			expectedInstancesCount: 50,
 		},
 		{
 			name:                   "Limit:70",
-			limit:                  70, // more than [MAX_PAGE_LIMIT]
+			limit:                  70, // more than [MaxPageLimit]
 			expectedInstancesCount: 70,
 		},
 		{
 			name:                   "Limit:-1",
 			limit:                  -1, // less than zero
-			expectedInstancesCount: UPPER_LIMIT,
+			expectedInstancesCount: UpperLimit,
 		},
 	}
 
@@ -397,7 +397,7 @@ func TestQueryFromListTagResources(t *testing.T) {
 			cli.limit = tc.limit
 			instances, err := cli.queryFromListTagResources(tagFilters)
 			require.NoError(t, err)
-			require.Equal(t, tc.expectedInstancesCount, len(instances))
+			require.Len(t, instances, tc.expectedInstancesCount)
 		})
 	}
 }
@@ -413,7 +413,7 @@ func TestQueryFromDescribeInstances(t *testing.T) {
 		{
 			name:                   "Limit:-1",
 			limit:                  -1, // less than zero
-			expectedInstancesCount: UPPER_LIMIT,
+			expectedInstancesCount: UpperLimit,
 		},
 		{
 			name:                   "Limit:0",
@@ -422,17 +422,17 @@ func TestQueryFromDescribeInstances(t *testing.T) {
 		},
 		{
 			name:                   "Limit:20",
-			limit:                  20, // less than [MAX_PAGE_LIMIT]
+			limit:                  20, // less than [MaxPageLimit]
 			expectedInstancesCount: 20,
 		},
 		{
 			name:                   "Limit:50",
-			limit:                  50, // equal to [MAX_PAGE_LIMIT]
+			limit:                  50, // equal to [MaxPageLimit]
 			expectedInstancesCount: 50,
 		},
 		{
 			name:                   "Limit:70",
-			limit:                  70, // more than [MAX_PAGE_LIMIT]
+			limit:                  70, // more than [MaxPageLimit]
 			expectedInstancesCount: 70,
 		},
 		{
@@ -447,7 +447,7 @@ func TestQueryFromDescribeInstances(t *testing.T) {
 			cli.limit = tc.limit
 			instances, err := cli.queryFromDescribeInstances()
 			require.NoError(t, err)
-			require.Equal(t, tc.expectedInstancesCount, len(instances))
+			require.Len(t, instances, tc.expectedInstancesCount)
 		})
 	}
 }
@@ -462,7 +462,7 @@ func TestGetCacheReCheckInstances(t *testing.T) {
 
 	for i := 0; i < totalCount; i++ {
 		labelSet := model.LabelSet{
-			ecsLabelInstanceId: model.LabelValue(strconv.Itoa(i)),
+			ecsLabelInstanceID: model.LabelValue(strconv.Itoa(i)),
 		}
 		allLabelSets[i] = labelSet
 
@@ -543,7 +543,7 @@ func TestListTagInstanceIds(t *testing.T) {
 			name:                   "TestTokenFirst",
 			token:                  "FIRST",
 			tagFilters:             tagFilters,
-			expectedInstancesCount: MAX_PAGE_LIMIT,
+			expectedInstancesCount: MaxPageLimit,
 			expectedError:          nil,
 		},
 		{
@@ -564,7 +564,7 @@ func TestListTagInstanceIds(t *testing.T) {
 			name:                   "TestTokenValid",
 			token:                  "50",
 			tagFilters:             tagFilters,
-			expectedInstancesCount: MAX_PAGE_LIMIT,
+			expectedInstancesCount: MaxPageLimit,
 			expectedError:          nil,
 		},
 		{
@@ -577,13 +577,13 @@ func TestListTagInstanceIds(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			ids, _, err := cli.listTagInstanceIds(tc.token, tc.tagFilters)
+			ids, _, err := cli.listTagInstanceIDs(tc.token, tc.tagFilters)
 			if tc.expectedError != nil {
 				require.EqualError(t, err, tc.expectedError.Error())
 			} else {
 				require.NoError(t, err)
 			}
-			require.Equal(t, tc.expectedInstancesCount, len(ids))
+			require.Len(t, ids, tc.expectedInstancesCount)
 		})
 	}
 }
@@ -644,8 +644,8 @@ func TestListTagInstances(t *testing.T) {
 		},
 		{
 			name:                   "Test1000/1000",
-			token:                  strconv.Itoa(UPPER_LIMIT),
-			currentTotalCount:      UPPER_LIMIT,
+			token:                  strconv.Itoa(UpperLimit),
+			currentTotalCount:      UpperLimit,
 			limit:                  -1,
 			tagFilters:             tagFilters,
 			expectedToken:          "",
@@ -660,7 +660,7 @@ func TestListTagInstances(t *testing.T) {
 			token, instances, err := cli.listTagInstances(tc.token, tc.currentTotalCount, tc.tagFilters)
 			require.NoError(t, err)
 			require.Equal(t, tc.expectedToken, token)
-			require.Equal(t, tc.expectedInstancesCount, len(instances))
+			require.Len(t, instances, tc.expectedInstancesCount)
 		})
 	}
 }
@@ -677,7 +677,7 @@ func contains(s []string, v string) bool {
 	return false
 }
 
-// instancesEqual determine whether two instance lists are the same based on id
+// instancesEqual determine whether two instance lists are the same based on id.
 func instancesEqual(instances1, instances2 []ecs_pop.Instance) bool {
 	// remove duplicate elements
 	ids1, ids2 := make(map[string]struct{}, 0), make(map[string]struct{}, 0)
