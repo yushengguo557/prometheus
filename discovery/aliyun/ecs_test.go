@@ -452,8 +452,6 @@ func TestQueryFromDescribeInstances(t *testing.T) {
 	}
 }
 
-// go test -v -timeout 30s -run ^TestQueryFromDescribeInstances$ github.com/prometheus/prometheus/discovery/aliyun
-
 func TestGetCacheReCheckInstances(t *testing.T) {
 	cli := newClient(t)
 	totalCount := 100
@@ -698,6 +696,3 @@ func instancesEqual(instances1, instances2 []ecs_pop.Instance) bool {
 	}
 	return true
 }
-
-// mockgen -source discovery/aliyun/ecs.go -destination discovery/aliyun/client_mock.go -package aliyun
-// go test -v -timeout 30s -run ^TestDescribeInstances$ github.com/prometheus/prometheus/discovery/aliyun
