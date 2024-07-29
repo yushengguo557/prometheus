@@ -158,6 +158,24 @@ func TestMergeHashInstances(t *testing.T) {
 		expected   []ecs_pop.Instance
 	}{
 		{
+			instances1: []ecs_pop.Instance{},
+			instances2: []ecs_pop.Instance{},
+			expected:   []ecs_pop.Instance{},
+		},
+		{
+			instances1: []ecs_pop.Instance{},
+			instances2: []ecs_pop.Instance{
+				{InstanceId: "1"},
+				{InstanceId: "2"},
+				{InstanceId: "3"},
+			},
+			expected: []ecs_pop.Instance{
+				{InstanceId: "1"},
+				{InstanceId: "2"},
+				{InstanceId: "3"},
+			},
+		},
+		{
 			instances1: []ecs_pop.Instance{
 				{InstanceId: "1"},
 				{InstanceId: "2"},
@@ -247,9 +265,9 @@ func TestECSConfigUnmarshalYAML(t *testing.T) {
 			err := config.UnmarshalYAML(unmarshal(d))
 			if tc.expectedError != nil {
 				require.EqualError(t, err, tc.expectedError.Error())
-			} else {
-				require.NoError(t, err)
+				return
 			}
+			require.NoError(t, err)
 		})
 	}
 }
@@ -262,45 +280,103 @@ func TestAddLabel(t *testing.T) {
 		instance       ecs_pop.Instance
 		expectedLabels model.LabelSet
 		expectedError  error
-	}{{
-		name:   "ClassicNetwork",
-		userID: "testUserId",
-		port:   8888,
-		instance: ecs_pop.Instance{
-			InstanceId:          "1",
-			RegionId:            "cn-beijing",
-			Status:              "Running",
-			ZoneId:              "cn-beijing",
-			InstanceNetworkType: "Classic",
-			PublicIpAddress: ecs_pop.PublicIpAddressInDescribeInstances{
-				IpAddress: []string{"1.2.3.4"},
+	}{
+		{
+			name:   "ClassicNetwork",
+			userID: "testUserId",
+			port:   8888,
+			instance: ecs_pop.Instance{
+				InstanceId:          "1",
+				RegionId:            "cn-beijing",
+				Status:              "Running",
+				ZoneId:              "cn-beijing",
+				InstanceNetworkType: "classic",
+				PublicIpAddress: ecs_pop.PublicIpAddressInDescribeInstances{
+					IpAddress: []string{"1.2.3.4"},
+				},
+				InnerIpAddress: ecs_pop.InnerIpAddressInDescribeInstances{
+					IpAddress: []string{"10.0.0.1"},
+				},
+				Tags: ecs_pop.TagsInDescribeInstances{
+					Tag: []ecs_pop.Tag{{TagKey: "app", TagValue: "k8s"}},
+				},
 			},
-			InnerIpAddress: ecs_pop.InnerIpAddressInDescribeInstances{
-				IpAddress: []string{"10.0.0.1"},
+			expectedLabels: model.LabelSet{
+				ecsLabelInstanceID:  "1",
+				ecsLabelRegionID:    "cn-beijing",
+				ecsLabelStatus:      "Running",
+				ecsLabelZoneID:      "cn-beijing",
+				ecsLabelNetworkType: "classic",
+				ecsLabelUserID:      "testUserId",
+				ecsLabelPublicIP:    "1.2.3.4",
+				ecsLabelInnerIP:     "10.0.0.1",
+				model.AddressLabel:  "10.0.0.1:8888",
+				ecsLabelTag + "app": "k8s",
 			},
-			Tags: ecs_pop.TagsInDescribeInstances{
-				Tag: []ecs_pop.Tag{{TagKey: "app", TagValue: "k8s"}},
-			},
+			expectedError: nil,
 		},
-		expectedLabels: model.LabelSet{
-			ecsLabelInstanceID:  "1",
-			ecsLabelRegionID:    "cn-beijing",
-			ecsLabelStatus:      "Running",
-			ecsLabelZoneID:      "cn-beijing",
-			ecsLabelNetworkType: "Classic",
-			ecsLabelUserID:      "testUserId",
-			ecsLabelPublicIP:    "1.2.3.4",
-			ecsLabelInnerIP:     "10.0.0.1",
-			model.AddressLabel:  "10.0.0.1:8888",
-			ecsLabelTag + "app": "k8s",
+		{
+			name:   "VPCNetwork",
+			userID: "testUserId",
+			port:   8888,
+			instance: ecs_pop.Instance{
+				InstanceId:          "2",
+				RegionId:            "cn-beijing",
+				Status:              "Running",
+				ZoneId:              "cn-beijing",
+				InstanceNetworkType: "vpc",
+				EipAddress: ecs_pop.EipAddressInDescribeInstances{
+					IpAddress: "1.2.3.4",
+				},
+				VpcAttributes: ecs_pop.VpcAttributes{
+					PrivateIpAddress: ecs_pop.PrivateIpAddressInDescribeInstanceAttribute{
+						IpAddress: []string{"10.0.0.1"},
+					},
+				},
+				Tags: ecs_pop.TagsInDescribeInstances{
+					Tag: []ecs_pop.Tag{{TagKey: "app", TagValue: "k8s"}},
+				},
+			},
+			expectedLabels: model.LabelSet{
+				ecsLabelInstanceID:  "2",
+				ecsLabelRegionID:    "cn-beijing",
+				ecsLabelStatus:      "Running",
+				ecsLabelZoneID:      "cn-beijing",
+				ecsLabelNetworkType: "vpc",
+				ecsLabelUserID:      "testUserId",
+				ecsLabelEip:         "1.2.3.4",
+				ecsLabelPrivateIP:   "10.0.0.1",
+				model.AddressLabel:  "10.0.0.1:8888",
+				ecsLabelTag + "app": "k8s",
+			},
+			expectedError: nil,
 		},
-		expectedError: nil,
-	}}
+		{
+			name:   "NoAddressLabel",
+			userID: "testUserId",
+			port:   8888,
+			instance: ecs_pop.Instance{
+				InstanceId: "3",
+				RegionId:   "cn-beijing",
+				Status:     "Running",
+				ZoneId:     "cn-beijing",
+				Tags: ecs_pop.TagsInDescribeInstances{
+					Tag: []ecs_pop.Tag{{TagKey: "app", TagValue: "k8s"}},
+				},
+			},
+			expectedLabels: nil,
+			expectedError:  fmt.Errorf("instance %s dont have AddressLabel", "3"),
+		},
+	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			labels, err := addLabel(tc.userID, tc.port, tc.instance)
-			require.Equal(t, tc.expectedError, err)
+			if tc.expectedError != nil {
+				require.EqualError(t, err, tc.expectedError.Error())
+				return
+			}
+			require.NoError(t, err)
 			require.True(t, labels.Equal(tc.expectedLabels))
 		})
 	}
@@ -524,19 +600,48 @@ func TestGetCacheReCheckInstances(t *testing.T) {
 
 func TestDescribeInstances(t *testing.T) {
 	cli := newClient(t)
-	ids := []string{"1", "2", "3", "4"}
 
-	expectedInstances := make([]ecs_pop.Instance, len(ids))
-	for i, id := range ids {
-		instance := ecs_pop.Instance{
-			InstanceId: id,
-		}
-		expectedInstances[i] = instance
+	testCases := []struct {
+		name              string
+		ids               []string
+		expectedInstances []ecs_pop.Instance
+		expectedError     error
+	}{
+		{
+			name:              "NilIds",
+			ids:               nil,
+			expectedInstances: []ecs_pop.Instance{},
+			expectedError:     nil,
+		},
+		{
+			name:              "EmptyIds",
+			ids:               []string{},
+			expectedInstances: []ecs_pop.Instance{},
+			expectedError:     nil,
+		},
+		{
+			name: "ThreeIds",
+			ids:  []string{"1", "2", "3"},
+			expectedInstances: []ecs_pop.Instance{
+				{InstanceId: "1"},
+				{InstanceId: "2"},
+				{InstanceId: "3"},
+			},
+			expectedError: nil,
+		},
 	}
 
-	instances, err := cli.describeInstances(ids)
-	require.NoError(t, err)
-	require.True(t, instancesEqual(instances, expectedInstances))
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			instances, err := cli.describeInstances(tc.ids)
+			if tc.expectedError != nil {
+				require.EqualError(t, err, tc.expectedError.Error())
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, instancesEqual(instances, tc.expectedInstances))
+		})
+	}
 }
 
 func TestListTagInstanceIds(t *testing.T) {
@@ -592,9 +697,9 @@ func TestListTagInstanceIds(t *testing.T) {
 			ids, _, err := cli.listTagInstanceIDs(tc.token, tc.tagFilters)
 			if tc.expectedError != nil {
 				require.EqualError(t, err, tc.expectedError.Error())
-			} else {
-				require.NoError(t, err)
+				return
 			}
+			require.NoError(t, err)
 			require.Len(t, ids, tc.expectedInstancesCount)
 		})
 	}
