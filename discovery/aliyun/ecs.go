@@ -217,33 +217,33 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 	return []*targetgroup.Group{tg}, nil
 }
 
-func (cli *ecsClient) QueryInstances(tagFilters []*TagFilter, cache *targetgroup.Group) ([]ecs_pop.Instance, error) {
+func (cl *ecsClient) QueryInstances(tagFilters []*TagFilter, cache *targetgroup.Group) ([]ecs_pop.Instance, error) {
 	if len(tagFilters) > 0 { // len(tagFilters) = 0 when tagFilters = nil
 		// 1. tagFilter situation. query ListTagResources first, then query DescribeInstances
-		instancesFromListTagResources, err := cli.queryFromListTagResources(tagFilters)
+		instancesFromListTagResources, err := cl.queryFromListTagResources(tagFilters)
 		if err != nil {
-			level.Debug(cli.logger).Log("msg", "Query Instances from ListTagResources during ECS discovery.", "err", err)
+			level.Debug(cl.logger).Log("msg", "Query Instances from ListTagResources during ECS discovery.", "err", err)
 			return nil, err
 		}
 		return instancesFromListTagResources, nil
 	}
 
 	// 2. no tagFilter situation. query DescribeInstances, then do cache double check.
-	instancesFromDescribeInstances, err := cli.queryFromDescribeInstances()
+	instancesFromDescribeInstances, err := cl.queryFromDescribeInstances()
 	if err != nil {
-		level.Debug(cli.logger).Log("msg", "Query Instances from DescribeInstances during ECS discovery.", "err", err)
+		level.Debug(cl.logger).Log("msg", "Query Instances from DescribeInstances during ECS discovery.", "err", err)
 		return nil, fmt.Errorf("query from DescribeInstances in QueryInstances, err: %w", err)
 	}
-	instancesFromCacheReCheck := cli.getCacheReCheckInstances(cache)
-	level.Info(cli.logger).Log("msg", "Found Instances from cache re-check during ECS discovery.", "count", len(instancesFromCacheReCheck))
+	instancesFromCacheReCheck := cl.getCacheReCheckInstances(cache)
+	level.Info(cl.logger).Log("msg", "Found Instances from cache re-check during ECS discovery.", "count", len(instancesFromCacheReCheck))
 	instances := mergeHashInstances(instancesFromDescribeInstances, instancesFromCacheReCheck)
 	return instances, nil
 }
 
 // listTagInstanceIDs get instance ids and filterred by tag.
-func (cli *ecsClient) listTagInstanceIDs(token string, tagFilters []*TagFilter) ([]string, string, error) {
+func (cl *ecsClient) listTagInstanceIDs(token string, tagFilters []*TagFilter) ([]string, string, error) {
 	listTagResourcesRequest := ecs_pop.CreateListTagResourcesRequest()
-	listTagResourcesRequest.RegionId = cli.regionID
+	listTagResourcesRequest.RegionId = cl.regionID
 	listTagResourcesRequest.ResourceType = "instance"
 
 	// FIRST token is empty, and continue
@@ -257,15 +257,15 @@ func (cli *ecsClient) listTagInstanceIDs(token string, tagFilters []*TagFilter) 
 
 	filters := tagFiltersCast(tagFilters)
 	listTagResourcesRequest.TagFilter = &filters
-	response, err := cli.ListTagResources(listTagResourcesRequest)
+	response, err := cl.ListTagResources(listTagResourcesRequest)
 	if err != nil {
 		return []string{}, "", fmt.Errorf("response from ListTagResources, err: %w", err)
 	}
-	level.Debug(cli.logger).Log("msg", "get response from ListTagResources.", "response: ", response)
+	level.Debug(cl.logger).Log("msg", "get response from ListTagResources.", "response: ", response)
 
 	tagResources := response.TagResources.TagResource
 	if len(tagResources) == 0 { // len(tagResources) = 0 when tagResources = nil
-		level.Debug(cli.logger).Log("msg", "ListTagResourcesTagFilter found no resources.", "response: ", response)
+		level.Debug(cl.logger).Log("msg", "ListTagResourcesTagFilter found no resources.", "response: ", response)
 		return []string{}, "", nil
 	}
 
@@ -273,14 +273,15 @@ func (cli *ecsClient) listTagInstanceIDs(token string, tagFilters []*TagFilter) 
 	for _, tagResource := range tagResources {
 		resourceIDs = append(resourceIDs, tagResource.ResourceId)
 	}
-	level.Debug(cli.logger).Log("msg", "listTagResource and get ECS instanceIds. for ListTagResourcesTagFilter.", "instanceIds: ", resourceIDs)
+	level.Debug(cl.logger).Log("msg", "listTagResource and get ECS instanceIds. for ListTagResourcesTagFilter.", "instanceIds: ", resourceIDs)
 	return resourceIDs, response.NextToken, nil
 }
 
-func tagFiltersCast(tagFilters []*TagFilter) (ret []ecs_pop.ListTagResourcesTagFilter) {
+func tagFiltersCast(tagFilters []*TagFilter) []ecs_pop.ListTagResourcesTagFilter {
+	var ret []ecs_pop.ListTagResourcesTagFilter
 	for _, tagFilter := range tagFilters {
 		if len(tagFilter.Values) == 0 {
-			return
+			continue
 		}
 		tagFilter := ecs_pop.ListTagResourcesTagFilter{
 			TagKey:    tagFilter.Key,
@@ -288,24 +289,24 @@ func tagFiltersCast(tagFilters []*TagFilter) (ret []ecs_pop.ListTagResourcesTagF
 		}
 		ret = append(ret, tagFilter)
 	}
-	return
+	return ret
 }
 
-func (cli *ecsClient) queryFromDescribeInstances() ([]ecs_pop.Instance, error) {
+func (cl *ecsClient) queryFromDescribeInstances() ([]ecs_pop.Instance, error) {
 	describeInstancesRequest := ecs_pop.CreateDescribeInstancesRequest()
-	describeInstancesRequest.RegionId = cli.regionID
+	describeInstancesRequest.RegionId = cl.regionID
 	describeInstancesRequest.PageSize = requests.NewInteger(MaxPageLimit)
 
-	instances := make([]ecs_pop.Instance, 0)
+	var instances []ecs_pop.Instance
 	pageNumber := 1
 	neededCount := MaxPageLimit // number of instances still needed
-	if cli.limit >= 0 {
-		neededCount = cli.limit
+	if cl.limit >= 0 {
+		neededCount = cl.limit
 	}
 
 	for neededCount > 0 {
 		describeInstancesRequest.PageNumber = requests.NewInteger(pageNumber)
-		response, err := cli.DescribeInstances(describeInstancesRequest)
+		response, err := cl.DescribeInstances(describeInstancesRequest)
 		if err != nil {
 			return nil, fmt.Errorf("could not get ecs describeInstances response, err: %w", err)
 		}
@@ -317,8 +318,8 @@ func (cli *ecsClient) queryFromDescribeInstances() ([]ecs_pop.Instance, error) {
 		// first page
 		if pageNumber == 1 {
 			neededCount = response.TotalCount
-			if cli.limit > 0 {
-				neededCount = min(neededCount, cli.limit)
+			if cl.limit > 0 {
+				neededCount = min(neededCount, cl.limit)
 			}
 		}
 		// if current page is last page, neededCount < count
@@ -335,9 +336,10 @@ func (cli *ecsClient) queryFromDescribeInstances() ([]ecs_pop.Instance, error) {
 // getCacheReCheckInstances
 // get cache targetGroup's instanceIDs, and query DescribeInstances again to double check.
 // every 50 instance per page.
-func (cli *ecsClient) getCacheReCheckInstances(cache *targetgroup.Group) (retInstances []ecs_pop.Instance) {
+func (cl *ecsClient) getCacheReCheckInstances(cache *targetgroup.Group) []ecs_pop.Instance {
 	pageCount := 0
-	instanceIDs := []string{}
+	var instanceIDs []string
+	var retInstances []ecs_pop.Instance
 	for tgLabelSetIndex, tgLabelSet := range cache.Targets {
 		pageCount++
 
@@ -347,9 +349,9 @@ func (cli *ecsClient) getCacheReCheckInstances(cache *targetgroup.Group) (retIns
 		// full of one page, or last one of LabelSet Series.
 		if pageCount >= MaxPageLimit || tgLabelSetIndex == (len(cache.Targets)-1) {
 			// query instances
-			instances, err := cli.describeInstances(instanceIDs)
+			instances, err := cl.describeInstances(instanceIDs)
 			if err != nil {
-				level.Error(cli.logger).Log("msg", "getCacheReCheckInstances describeInstancesResponse err.", "err: ", err)
+				level.Error(cl.logger).Log("msg", "getCacheReCheckInstances describeInstancesResponse err.", "err: ", err)
 				continue
 			}
 
@@ -364,9 +366,12 @@ func (cli *ecsClient) getCacheReCheckInstances(cache *targetgroup.Group) (retIns
 
 // queryFromListTagResources
 // token query.
-func (cli *ecsClient) queryFromListTagResources(tagFilters []*TagFilter) (instances []ecs_pop.Instance, err error) {
-	token := "FIRST"
+func (cl *ecsClient) queryFromListTagResources(tagFilters []*TagFilter) ([]ecs_pop.Instance, error) {
 	var currentInstances []ecs_pop.Instance
+	var retInstances []ecs_pop.Instance
+	var err error
+
+	token := "FIRST"
 	currentTotalCount := 0 // the number of instances that have been queried
 	originalToken := "INIT"
 	for {
@@ -375,7 +380,7 @@ func (cli *ecsClient) queryFromListTagResources(tagFilters []*TagFilter) (instan
 		}
 
 		originalToken = token
-		token, currentInstances, err = cli.listTagInstances(token, currentTotalCount, tagFilters)
+		token, currentInstances, err = cl.listTagInstances(token, currentTotalCount, tagFilters)
 		if err != nil {
 			return nil, fmt.Errorf("list tag instances, err: %w", err)
 		}
@@ -384,43 +389,47 @@ func (cli *ecsClient) queryFromListTagResources(tagFilters []*TagFilter) (instan
 			break
 		}
 		currentTotalCount += len(currentInstances)
-		instances = append(instances, currentInstances...)
+		retInstances = append(retInstances, currentInstances...)
 	}
-	return instances, nil
+	return retInstances, nil
 }
 
 // describeInstances get instance
 // page query, max size 50 every page.
-func (cli *ecsClient) describeInstances(ids []string) ([]ecs_pop.Instance, error) {
+func (cl *ecsClient) describeInstances(ids []string) ([]ecs_pop.Instance, error) {
 	describeInstancesRequest := ecs_pop.CreateDescribeInstancesRequest()
-	describeInstancesRequest.RegionId = cli.regionID
+	describeInstancesRequest.RegionId = cl.regionID
+	describeInstancesRequest.PageNumber = requests.NewInteger(1)
+	describeInstancesRequest.PageSize = requests.NewInteger(MaxPageLimit)
+
+	if ids == nil {
+		ids = []string{}
+	}
 	idsJSON, err := json.Marshal(ids)
 	if err != nil {
 		return []ecs_pop.Instance{}, err
 	}
 	describeInstancesRequest.InstanceIds = string(idsJSON)
-	describeInstancesRequest.PageNumber = requests.NewInteger(1)
-	describeInstancesRequest.PageSize = requests.NewInteger(MaxPageLimit)
 
-	response, err := cli.DescribeInstances(describeInstancesRequest)
+	response, err := cl.DescribeInstances(describeInstancesRequest)
 	if err != nil {
 		return []ecs_pop.Instance{}, fmt.Errorf("could not invoke DescribeInstances API, err: %w", err)
 	}
 	return response.Instances.Instance, nil
 }
 
-func (cli *ecsClient) listTagInstances(token string, currentTotalCount int, tagFilters []*TagFilter) (string, []ecs_pop.Instance, error) {
-	ids, nextToken, err := cli.listTagInstanceIDs(token, tagFilters)
+func (cl *ecsClient) listTagInstances(token string, currentTotalCount int, tagFilters []*TagFilter) (string, []ecs_pop.Instance, error) {
+	ids, nextToken, err := cl.listTagInstanceIDs(token, tagFilters)
 	if err != nil {
-		return "", nil, fmt.Errorf("get ecs instanceIds, err: %w", err)
+		return "", nil, fmt.Errorf("get ecs instance ids, err: %w", err)
 	}
-	instances, err := cli.describeInstances(ids)
+	instances, err := cl.describeInstances(ids)
 	if err != nil {
-		return "", nil, fmt.Errorf("get ecs instance ids err: %w", err)
+		return "", nil, fmt.Errorf("get ecs instances(ids: %s) err: %w", ids, err)
 	}
 
 	pageLimit := len(instances)
-	currentLimit := cli.limit - currentTotalCount // remaining instance count
+	currentLimit := cl.limit - currentTotalCount // remaining instance count
 	if 0 <= currentLimit && currentLimit < pageLimit {
 		pageLimit = currentLimit
 	}
@@ -455,7 +464,7 @@ func newECSClient(config *ECSConfig, logger log.Logger) (*ecsClient, error) {
 	}, nil
 }
 
-func getClient(config *ECSConfig, logger log.Logger) (cli client, err error) {
+func getClient(config *ECSConfig, logger log.Logger) (*ecs_pop.Client, error) {
 	level.Debug(logger).Log("msg", "Start to get Ecs Client.")
 
 	if config.RegionID == "" {
@@ -554,7 +563,7 @@ func mergeHashInstances(instances1, instances2 []ecs_pop.Instance) []ecs_pop.Ins
 		instancesMap[each.InstanceId] = each
 	}
 
-	instances := []ecs_pop.Instance{}
+	var instances []ecs_pop.Instance
 	for _, eachInstance := range instancesMap {
 		instances = append(instances, eachInstance)
 	}
