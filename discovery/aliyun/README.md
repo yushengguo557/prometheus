@@ -14,7 +14,7 @@ scrape_configs:
   scrape_timeout: 10s
   metrics_path: /metrics
   scheme: https
-  aliyun_sd_configs:
+  ecs_sd_configs:
     - port:  8888                                 # Prometheus crawling collection point port after service discovery
       user_id: <aliyun userId>                    # Aliyun user id, optional, filling this in will add the label __meta_ecs_user_id to the discovery target.
       refresh_interval: 30s
